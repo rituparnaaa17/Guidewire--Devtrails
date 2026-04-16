@@ -1,86 +1,122 @@
-import { query } from '../config/db.js';
+/**
+ * services/weatherService.js — Real OpenWeatherMap Edition
+ * ─────────────────────────────────────────────────────────────────────────────
+ * PRIMARY:  OpenWeatherMap API (lat/lon → real rainfall, temperature)
+ * FALLBACK: Zone-hash simulation (when API key missing / rate-limited)
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
-const round2 = (value) => Math.round(value * 100) / 100;
+import prisma from '../config/db.js';
+
+const OWM_KEY     = process.env.OPENWEATHER_API_KEY;
+const OWM_URL     = 'https://api.openweathermap.org/data/2.5/weather';
+const TIMEOUT_MS  = 5000;
+
+const round2 = (v) => Math.round(v * 100) / 100;
+
+// ─── Real OpenWeatherMap fetch ────────────────────────────────────────────────
+
+export const fetchWeatherForCoords = async (lat, lon) => {
+  if (!OWM_KEY) throw new Error('OPENWEATHER_API_KEY not set');
+
+  const url        = `${OWM_URL}?lat=${lat}&lon=${lon}&appid=${OWM_KEY}&units=metric`;
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const res  = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+
+    if (!res.ok) throw new Error(`OWM ${res.status}: ${res.statusText}`);
+    const data = await res.json();
+
+    // OWM reports rain as mm in last 1h or 3h
+    const rainfall1h  = data.rain?.['1h']  ?? 0;
+    const rainfall3h  = (data.rain?.['3h'] ?? 0) / 3;
+    const rainfall    = round2(Math.max(rainfall1h, rainfall3h));
+    const temp        = round2(data.main?.temp ?? 0);
+    const humidity    = data.main?.humidity ?? 0;
+    const description = data.weather?.[0]?.description ?? 'unknown';
+    const cityName    = data.name ?? 'Unknown';
+
+    return {
+      rainfallMmPerHour: rainfall,
+      heatIndex:         temp,
+      humidity,
+      weatherStatus:     rainfall > 10 ? 'heavy_rain' : temp > 35 ? 'heat_stress' : 'clear',
+      cityName,
+      description,
+      source:            'openweathermap-live',
+      rawPayload: {
+        provider: 'openweathermap', lat, lon, rainfall_mm: rainfall,
+        temp_c: temp, humidity, description, city: cityName,
+      },
+    };
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+};
+
+// ─── Fallback: zone-hash deterministic simulation ─────────────────────────────
 
 const hashZone = (zone) => {
-  const seed = `${zone.id}:${zone.zone_code}:${zone.zone_name}`;
+  const seed = `${zone.id}:${zone.zoneCode}:${zone.zoneName}`;
   let total = 0;
-  for (const char of seed) total += char.charCodeAt(0);
+  for (const ch of seed) total += ch.charCodeAt(0);
   return total;
 };
 
-const buildWeatherReading = (zone) => {
-  const hash = hashZone(zone);
-  const isDemoZone = /velachery/i.test(zone.zone_name) || zone.zone_code === 'CHN-VEL';
+const buildFallbackReading = (zone) => {
+  const hash       = hashZone(zone);
+  const isDemoZone = /velachery/i.test(zone.zoneName) || zone.zoneCode === 'CHN-VEL';
 
   if (isDemoZone) {
-    return {
-      rainfall_mm_per_hour: 42,
-      heat_index: 37,
-      weather_status: 'heavy_rain',
-      source: 'mock-weather-demo',
-      raw_payload: {
-        provider: 'mock-weather-demo',
-        zone_code: zone.zone_code,
-        rainfall_mm_per_hour: 42,
-        heat_index: 37,
-        weather_status: 'heavy_rain',
-        flood_severity: 84,
-      },
-    };
+    return { rainfallMmPerHour: 42, heatIndex: 37, weatherStatus: 'heavy_rain', source: 'simulation-demo',
+      cityName: 'Chennai', rawPayload: { provider: 'simulation-demo', rainfall_mm: 42, temp_c: 37 } };
   }
-
-  const rainfall_mm_per_hour = round2((hash % 18) + 2);
-  const heat_index = round2(28 + (hash % 11));
-  const flood_severity = Math.min(100, round2(rainfall_mm_per_hour * 2.1 + (hash % 7)));
-
-  return {
-    rainfall_mm_per_hour,
-    heat_index,
-    weather_status: rainfall_mm_per_hour >= 25 ? 'heavy_rain' : 'clear',
-    source: 'mock-weather-adapter',
-    raw_payload: {
-      provider: 'mock-weather-adapter',
-      zone_code: zone.zone_code,
-      rainfall_mm_per_hour,
-      heat_index,
-      flood_severity,
-      weather_status: rainfall_mm_per_hour >= 25 ? 'heavy_rain' : 'clear',
-    },
-  };
+  const rainfall = round2((hash % 18) + 2);
+  const heat     = round2(28 + (hash % 11));
+  return { rainfallMmPerHour: rainfall, heatIndex: heat,
+    weatherStatus: rainfall >= 25 ? 'heavy_rain' : 'clear', source: 'simulation-fallback',
+    cityName: zone.city, rawPayload: { provider: 'simulation-fallback', rainfall_mm: rainfall, temp_c: heat } };
 };
 
+// ─── Per-zone snapshot (for scheduler) ───────────────────────────────────────
+
 export const fetchWeatherSnapshotForZone = async (zone) => {
-  const reading = buildWeatherReading(zone);
+  let reading;
 
-  const { rows } = await query(
-    `INSERT INTO weather_snapshots
-       (zone_id, rainfall_mm_per_hour, heat_index, weather_status, source, raw_payload)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING *`,
-    [
-      zone.id,
-      reading.rainfall_mm_per_hour,
-      reading.heat_index,
-      reading.weather_status,
-      reading.source,
-      JSON.stringify(reading.raw_payload),
-    ]
-  );
+  // If zone has coordinates, try real API
+  if (OWM_KEY && zone.centerLat && zone.centerLon) {
+    try {
+      reading = await fetchWeatherForCoords(zone.centerLat, zone.centerLon);
+    } catch (err) {
+      console.warn(`[weatherService] OWM failed for ${zone.zoneCode}: ${err.message} — using fallback`);
+      reading = buildFallbackReading(zone);
+    }
+  } else {
+    reading = buildFallbackReading(zone);
+  }
 
-  return rows[0];
+  return prisma.weatherSnapshot.create({
+    data: {
+      zoneId:            zone.id,
+      rainfallMmPerHour: reading.rainfallMmPerHour,
+      heatIndex:         reading.heatIndex,
+      weatherStatus:     reading.weatherStatus,
+      source:            reading.source,
+      rawPayload:        reading.rawPayload,
+    },
+  });
 };
 
 export const getLatestWeatherSnapshots = async () => {
-  const { rows } = await query(
-    `SELECT DISTINCT ON (zone_id) *
-     FROM weather_snapshots
-     ORDER BY zone_id, recorded_at DESC`
+  const zones = await prisma.zone.findMany({ select: { id: true } });
+  const snapshots = await Promise.all(
+    zones.map((z) => prisma.weatherSnapshot.findFirst({ where: { zoneId: z.id }, orderBy: { recordedAt: 'desc' } }))
   );
-  return rows;
+  return snapshots.filter(Boolean);
 };
 
-export const getAllZones = async () => {
-  const { rows } = await query('SELECT * FROM zones ORDER BY zone_name ASC');
-  return rows;
-};
+export const getAllZones = async () => prisma.zone.findMany({ orderBy: { zoneName: 'asc' } });

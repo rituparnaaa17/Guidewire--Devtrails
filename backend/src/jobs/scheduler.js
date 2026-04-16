@@ -1,34 +1,59 @@
+import cron from 'node-cron';
 import { config } from '../config/env.js';
-import { pollWeather } from './poll_weather.js';
-import { pollAqi } from './poll_aqi.js';
-import { detectTriggers } from './detect_triggers.js';
-import { processClaims } from './process_claims.js';
+import { getAllZones } from '../services/weatherService.js';
+import { fetchWeatherSnapshotForZone } from '../services/weatherService.js';
+import { fetchAqiSnapshotForZone } from '../services/aqiService.js';
+import { evaluateTriggerRules } from '../services/triggerService.js';
+import { processClaimsForActiveTriggers } from '../services/claimService.js';
 
-const minute = (value) => Math.max(1, Number(value) || 1) * 60 * 1000;
-
-const schedule = (task, intervalMs, label) => {
-  const run = async () => {
-    try {
-      await task();
-      console.log(`[scheduler] ${label} completed`);
-    } catch (error) {
-      console.error(`[scheduler] ${label} failed:`, error.message);
-    }
-  };
-
-  run();
-  const handle = setInterval(run, intervalMs);
-  handle.unref?.();
-  return handle;
-};
+const toMinutes = (minutes) => `*/${minutes} * * * *`;
 
 export const startSchedulers = () => {
-  const handles = [
-    schedule(pollWeather, minute(config.intervals.pollWeatherMinutes), 'poll_weather'),
-    schedule(pollAqi, minute(config.intervals.pollAqiMinutes), 'poll_aqi'),
-    schedule(detectTriggers, minute(config.intervals.detectTriggersMinutes), 'detect_triggers'),
-    schedule(processClaims, minute(config.intervals.processClaimsMinutes), 'process_claims'),
-  ];
+  console.log('⏰ Starting ShieldPay schedulers...');
 
-  return handles;
+  // Poll weather data
+  cron.schedule(toMinutes(config.intervals.pollWeatherMinutes), async () => {
+    try {
+      const zones = await getAllZones();
+      await Promise.all(zones.map((z) => fetchWeatherSnapshotForZone(z)));
+      console.log(`🌦️  Weather polled for ${zones.length} zones`);
+    } catch (err) {
+      console.error('Weather poll error:', err.message);
+    }
+  });
+
+  // Poll AQI data
+  cron.schedule(toMinutes(config.intervals.pollAqiMinutes), async () => {
+    try {
+      const zones = await getAllZones();
+      await Promise.all(zones.map((z) => fetchAqiSnapshotForZone(z)));
+      console.log(`💨 AQI polled for ${zones.length} zones`);
+    } catch (err) {
+      console.error('AQI poll error:', err.message);
+    }
+  });
+
+  // Detect triggers
+  cron.schedule(toMinutes(config.intervals.detectTriggersMinutes), async () => {
+    try {
+      const results = await evaluateTriggerRules();
+      const active  = results.filter((r) => r.action !== 'resolved').length;
+      const resolved = results.filter((r) => r.action === 'resolved').length;
+      if (results.length) console.log(`⚡ Triggers: ${active} active, ${resolved} resolved`);
+    } catch (err) {
+      console.error('Trigger detection error:', err.message);
+    }
+  });
+
+  // Process claims
+  cron.schedule(toMinutes(config.intervals.processClaimsMinutes), async () => {
+    try {
+      const results = await processClaimsForActiveTriggers();
+      if (results.length) console.log(`🧾 Claims processed: ${results.length} updates`);
+    } catch (err) {
+      console.error('Claim processing error:', err.message);
+    }
+  });
+
+  console.log('✅ All schedulers active');
 };

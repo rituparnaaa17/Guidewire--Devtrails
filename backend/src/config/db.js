@@ -1,29 +1,19 @@
-import pg from 'pg';
-import { config } from './env.js';
+import { PrismaClient } from '@prisma/client';
 
-const { Pool } = pg;
+// Singleton pattern — prevent multiple Prisma instances during hot-reload
+const globalForPrisma = globalThis;
 
-const pool = new Pool({
-  host: config.db.host,
-  port: config.db.port,
-  database: config.db.database,
-  user: config.db.user,
-  password: config.db.password,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+const prisma = globalForPrisma.prisma ?? new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
 });
 
-pool.on('error', (err) => {
-  console.error('Unexpected DB pool error:', err.message);
-});
-
-export const query = (text, params) => pool.query(text, params);
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = prisma;
+}
 
 export const testConnection = async () => {
-  const client = await pool.connect();
-  client.release();
-  console.log('✅ PostgreSQL connected successfully');
+  await prisma.$connect();
+  console.log('✅ PostgreSQL (Prisma) connected successfully');
 };
 
-export default pool;
+export default prisma;

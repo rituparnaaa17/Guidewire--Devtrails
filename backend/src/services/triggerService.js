@@ -1,171 +1,218 @@
-import { query } from '../config/db.js';
+/**
+ * triggerService.js — Prisma edition
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Parametric Insurance — Trigger Detection Engine (L1 / L2 / L3 tiers)
+ *
+ *   RAIN     L1 > 35 mm/h  |  L2 > 50 mm/h  |  L3 > 75 mm/h
+ *   AQI      L1 > 200      |  L2 > 300       |  L3 > 400
+ *   HEAT     L1 > 38 °C    |  L2 > 42 °C     |  L3 > 46 °C
+ *   FLOOD    derived from rainfall * 2 severity formula
+ *   ZONE_SHUTDOWN  admin flag via ZONE_SHUTDOWN_ZONE_CODES env var
+ *
+ * Level multipliers (used downstream for payout):
+ *   L1 → 0.60  |  L2 → 0.85  |  L3 → 1.00
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import prisma from '../config/db.js';
 import { config } from '../config/env.js';
 import { getLatestAqiSnapshots } from './aqiService.js';
 import { getLatestWeatherSnapshots } from './weatherService.js';
 
-const TRIGGER_TYPES = ['HEAVY_RAIN', 'FLOOD', 'SEVERE_AQI', 'HEATWAVE', 'ZONE_SHUTDOWN'];
+// ─── Tier definitions ─────────────────────────────────────────────────────────
 
-const parsePayload = (value) => {
-  if (!value) return {};
-  if (typeof value === 'object') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return {};
-  }
+export const TRIGGER_TIERS = {
+  HEAVY_RAIN:    [
+    { level: 1, threshold: 35,  multiplier: 0.60, label: 'Rain Level 1' },
+    { level: 2, threshold: 50,  multiplier: 0.85, label: 'Rain Level 2' },
+    { level: 3, threshold: 75,  multiplier: 1.00, label: 'Rain Level 3' },
+  ],
+  SEVERE_AQI:   [
+    { level: 1, threshold: 200, multiplier: 0.60, label: 'AQI Level 1' },
+    { level: 2, threshold: 300, multiplier: 0.85, label: 'AQI Level 2' },
+    { level: 3, threshold: 400, multiplier: 1.00, label: 'AQI Level 3' },
+  ],
+  HEATWAVE:     [
+    { level: 1, threshold: 38,  multiplier: 0.60, label: 'Heat Level 1' },
+    { level: 2, threshold: 42,  multiplier: 0.85, label: 'Heat Level 2' },
+    { level: 3, threshold: 46,  multiplier: 1.00, label: 'Heat Level 3' },
+  ],
+  FLOOD:        [
+    { level: 1, threshold: 70,  multiplier: 0.60, label: 'Flood Level 1' },
+    { level: 2, threshold: 85,  multiplier: 0.85, label: 'Flood Level 2' },
+    { level: 3, threshold: 95,  multiplier: 1.00, label: 'Flood Level 3' },
+  ],
+  ZONE_SHUTDOWN: [
+    { level: 3, threshold: 1,   multiplier: 1.00, label: 'Zone Shutdown' },
+  ],
 };
 
-const getFloodSeverity = (weatherSnapshot) => {
-  const raw = parsePayload(weatherSnapshot?.raw_payload);
-  if (typeof raw.flood_severity === 'number') return raw.flood_severity;
-  const rainfall = Number(weatherSnapshot?.rainfall_mm_per_hour ?? 0);
-  return Math.min(100, Math.round(rainfall * 2 + (raw.weather_status === 'heavy_rain' ? 15 : 0)));
+export const LEVEL_MULTIPLIERS = { 1: 0.60, 2: 0.85, 3: 1.00 };
+export const TRIGGER_TYPES_SUPPORTED = Object.keys(TRIGGER_TIERS);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * detectTriggerLevel(triggerType, rawValue) → highest breached tier | null
+ */
+export const detectTriggerLevel = (triggerType, rawValue) => {
+  const tiers = TRIGGER_TIERS[triggerType];
+  if (!tiers) return null;
+
+  let matched = null;
+  for (const tier of tiers) {
+    if (Number(rawValue) >= tier.threshold) matched = tier;
+  }
+  if (!matched) return null;
+
+  const unit = triggerType === 'HEAVY_RAIN' || triggerType === 'FLOOD'
+    ? 'mm/h'
+    : triggerType === 'SEVERE_AQI' ? 'AQI' : '°C';
+
+  return {
+    ...matched,
+    triggerReason: `${matched.label} — ${rawValue} ${unit} ≥ threshold ${matched.threshold} ${unit}`,
+  };
+};
+
+/**
+ * detectTriggers(zoneData) → array of active trigger descriptors for this zone
+ */
+export const detectTriggers = (zoneData) => {
+  const { zone, weather, aqi } = zoneData;
+
+  const rainfall    = Number(weather?.rainfallMmPerHour ?? 0);
+  const heatIndex   = Number(weather?.heatIndex         ?? 0);
+  const aqiValue    = Number(aqi?.aqi                   ?? 0);
+  const rawPayload  = weather?.rawPayload ?? {};
+  const aqiPayload  = aqi?.rawPayload    ?? {};
+
+  const floodSeverity = typeof rawPayload.flood_severity === 'number'
+    ? rawPayload.flood_severity
+    : Math.min(100, Math.round(rainfall * 2 + (rawPayload.weather_status === 'heavy_rain' ? 15 : 0)));
+
+  const candidates = [
+    { type: 'HEAVY_RAIN',    value: rainfall,      source: weather?.source ?? 'mock-weather', payload: rawPayload },
+    { type: 'FLOOD',          value: floodSeverity, source: weather?.source ?? 'mock-weather', payload: { ...rawPayload, flood_severity: floodSeverity } },
+    { type: 'SEVERE_AQI',    value: aqiValue,      source: aqi?.source    ?? 'mock-aqi',     payload: aqiPayload },
+    { type: 'HEATWAVE',      value: heatIndex,     source: weather?.source ?? 'mock-weather', payload: rawPayload },
+    {
+      type:    'ZONE_SHUTDOWN',
+      value:   isZoneShutdown(zone) ? 100 : 0,
+      source:  'mock-zone-shutdown',
+      payload: { zone_code: zone.zoneCode, shutdown: isZoneShutdown(zone) },
+    },
+  ];
+
+  const results = [];
+  for (const c of candidates) {
+    const tier = detectTriggerLevel(c.type, c.value);
+    if (tier) {
+      results.push({
+        zoneId:        zone.id,
+        triggerType:   c.type,
+        severity:      c.value,
+        triggerLevel:  tier.level,
+        multiplier:    tier.multiplier,
+        triggerReason: tier.triggerReason,
+        source:        c.source,
+        rawPayload:    { ...c.payload, trigger_level: tier.level, multiplier: tier.multiplier },
+        startTime:     new Date(),
+      });
+    }
+  }
+  return results;
 };
 
 const isZoneShutdown = (zone) => {
-  const shutdownZones = (process.env.ZONE_SHUTDOWN_ZONE_CODES ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
-  return shutdownZones.includes(zone.zone_code) || /shutdown/i.test(zone.zone_name);
+  const codes = (process.env.ZONE_SHUTDOWN_ZONE_CODES ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  return codes.includes(zone.zoneCode) || /shutdown/i.test(zone.zoneName);
 };
 
-const fetchActiveTrigger = async (zoneId, triggerType) => {
-  const { rows } = await query(
-    `SELECT *
-     FROM trigger_events
-     WHERE zone_id = $1
-       AND trigger_type = $2
-       AND status = 'active'
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [zoneId, triggerType]
-  );
-  return rows[0] ?? null;
-};
+// ─── DB persistence ───────────────────────────────────────────────────────────
 
 const upsertActiveTrigger = async ({ zoneId, triggerType, severity, source, rawPayload, startTime }) => {
-  const existing = await fetchActiveTrigger(zoneId, triggerType);
+  const existing = await prisma.triggerEvent.findFirst({
+    where: { zoneId, triggerType, status: 'active' },
+    orderBy: { createdAt: 'desc' },
+  });
 
   if (existing) {
-    const { rows } = await query(
-      `UPDATE trigger_events
-       SET severity = $1,
-           end_time = $2,
-           source = $3,
-           raw_payload = $4,
-           updated_at = NOW()
-       WHERE id = $5
-       RETURNING *`,
-      [severity, new Date().toISOString(), source, JSON.stringify(rawPayload), existing.id]
-    );
-    return rows[0];
+    return prisma.triggerEvent.update({
+      where: { id: existing.id },
+      data:  { severity, source, rawPayload, endTime: new Date() },
+    });
   }
 
-  const { rows } = await query(
-    `INSERT INTO trigger_events
-       (zone_id, trigger_type, severity, start_time, end_time, status, source, raw_payload)
-     VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)
-     RETURNING *`,
-    [zoneId, triggerType, severity, startTime ?? new Date().toISOString(), null, source, JSON.stringify(rawPayload)]
-  );
-  return rows[0];
+  return prisma.triggerEvent.create({
+    data: { zoneId, triggerType, severity, source, rawPayload, startTime, status: 'active' },
+  });
 };
 
-const resolveTrigger = async (existing, source, rawPayload) => {
-  if (!existing || existing.status !== 'active') return null;
-
-  const { rows } = await query(
-    `UPDATE trigger_events
-     SET status = 'resolved',
-         end_time = COALESCE(end_time, NOW()),
-         source = $1,
-         raw_payload = $2,
-         updated_at = NOW()
-     WHERE id = $3
-     RETURNING *`,
-    [source, JSON.stringify(rawPayload), existing.id]
-  );
-  return rows[0];
+const resolveTrigger = async (trigger) => {
+  if (!trigger || trigger.status !== 'active') return null;
+  return prisma.triggerEvent.update({
+    where: { id: trigger.id },
+    data:  { status: 'resolved', endTime: trigger.endTime ?? new Date() },
+  });
 };
+
+// ─── Main evaluation pipeline ─────────────────────────────────────────────────
 
 export const getLatestSnapshotsByZone = async () => {
   const [weatherSnapshots, aqiSnapshots, zones] = await Promise.all([
     getLatestWeatherSnapshots(),
     getLatestAqiSnapshots(),
-    query('SELECT * FROM zones ORDER BY zone_name ASC'),
+    prisma.zone.findMany({ orderBy: { zoneName: 'asc' } }),
   ]);
 
-  const weatherByZone = new Map(weatherSnapshots.map((snapshot) => [snapshot.zone_id, snapshot]));
-  const aqiByZone = new Map(aqiSnapshots.map((snapshot) => [snapshot.zone_id, snapshot]));
+  const weatherByZone = new Map(weatherSnapshots.map((s) => [s.zoneId, s]));
+  const aqiByZone     = new Map(aqiSnapshots.map((s) => [s.zoneId, s]));
 
-  return zones.rows.map((zone) => ({
+  return zones.map((zone) => ({
     zone,
     weather: weatherByZone.get(zone.id) ?? null,
-    aqi: aqiByZone.get(zone.id) ?? null,
+    aqi:     aqiByZone.get(zone.id)     ?? null,
   }));
 };
 
 export const evaluateTriggerRules = async () => {
-  const zones = await getLatestSnapshotsByZone();
+  const zones   = await getLatestSnapshotsByZone();
   const results = [];
 
-  for (const { zone, weather, aqi } of zones) {
-    const weatherPayload = parsePayload(weather?.raw_payload);
-    const aqiPayload = parsePayload(aqi?.raw_payload);
-    const floodSeverity = getFloodSeverity(weather);
+  for (const zoneData of zones) {
+    const activeTriggers     = detectTriggers(zoneData);
+    const activeTriggerTypes = new Set(activeTriggers.map((t) => t.triggerType));
 
-    const rules = [
-      {
-        triggerType: 'HEAVY_RAIN',
-        active: Number(weather?.rainfall_mm_per_hour ?? 0) >= config.thresholds.heavyRain,
-        severity: Number(weather?.rainfall_mm_per_hour ?? 0),
-        source: weather?.source ?? 'mock-weather-adapter',
-        rawPayload: weatherPayload,
-      },
-      {
-        triggerType: 'FLOOD',
-        active: floodSeverity >= config.thresholds.flood,
-        severity: floodSeverity,
-        source: weather?.source ?? 'mock-weather-adapter',
-        rawPayload: { ...weatherPayload, flood_severity: floodSeverity },
-      },
-      {
-        triggerType: 'SEVERE_AQI',
-        active: Number(aqi?.aqi ?? 0) >= config.thresholds.aqi,
-        severity: Number(aqi?.aqi ?? 0),
-        source: aqi?.source ?? 'mock-aqi-adapter',
-        rawPayload: aqiPayload,
-      },
-      {
-        triggerType: 'HEATWAVE',
-        active: Number(weather?.heat_index ?? 0) >= config.thresholds.heatIndex,
-        severity: Number(weather?.heat_index ?? 0),
-        source: weather?.source ?? 'mock-weather-adapter',
-        rawPayload: weatherPayload,
-      },
-      {
-        triggerType: 'ZONE_SHUTDOWN',
-        active: isZoneShutdown(zone),
-        severity: isZoneShutdown(zone) ? 100 : 0,
-        source: 'mock-zone-shutdown-service',
-        rawPayload: { zone_code: zone.zone_code, shutdown: isZoneShutdown(zone) },
-      },
-    ];
+    for (const t of activeTriggers) {
+      const trigger = await upsertActiveTrigger({
+        zoneId:      t.zoneId,
+        triggerType: t.triggerType,
+        severity:    t.severity,
+        source:      t.source,
+        rawPayload:  t.rawPayload,
+        startTime:   t.startTime,
+      });
+      const isNew = !trigger.endTime || (new Date(trigger.endTime).getTime() === new Date(trigger.startTime).getTime());
+      results.push({
+        action:        isNew ? 'created' : 'updated',
+        trigger,
+        triggerLevel:  t.triggerLevel,
+        multiplier:    t.multiplier,
+        triggerReason: t.triggerReason,
+      });
+    }
 
-    for (const rule of rules) {
-      const existing = await fetchActiveTrigger(zone.id, rule.triggerType);
-
-      if (rule.active) {
-        const trigger = await upsertActiveTrigger({
-          zoneId: zone.id,
-          triggerType: rule.triggerType,
-          severity: rule.severity,
-          source: rule.source,
-          rawPayload: rule.rawPayload,
-          startTime: existing?.start_time ?? new Date().toISOString(),
+    // Resolve stale active triggers
+    for (const type of TRIGGER_TYPES_SUPPORTED) {
+      if (!activeTriggerTypes.has(type)) {
+        const stale = await prisma.triggerEvent.findFirst({
+          where: { zoneId: zoneData.zone.id, triggerType: type, status: 'active' },
         });
-        results.push({ action: existing ? 'updated' : 'created', trigger });
-      } else if (existing) {
-        const resolved = await resolveTrigger(existing, rule.source, rule.rawPayload);
-        if (resolved) results.push({ action: 'resolved', trigger: resolved });
+        if (stale) {
+          const resolved = await resolveTrigger(stale);
+          if (resolved) results.push({ action: 'resolved', trigger: resolved });
+        }
       }
     }
   }
@@ -173,40 +220,24 @@ export const evaluateTriggerRules = async () => {
   return results;
 };
 
+// ─── Query helpers ────────────────────────────────────────────────────────────
+
 export const listActiveTriggers = async ({ zoneId = null } = {}) => {
-  const params = [];
-  let whereClause = `WHERE status = 'active'`;
-
-  if (zoneId) {
-    params.push(zoneId);
-    whereClause += ` AND zone_id = $${params.length}`;
-  }
-
-  const { rows } = await query(
-    `SELECT te.*, z.zone_name, z.zone_code, z.city, z.state
-     FROM trigger_events te
-     JOIN zones z ON z.id = te.zone_id
-     ${whereClause}
-     ORDER BY te.created_at DESC`,
-    params
-  );
-
-  return rows;
+  const where = { status: 'active', ...(zoneId ? { zoneId } : {}) };
+  return prisma.triggerEvent.findMany({
+    where,
+    include: { zone: { select: { zoneName: true, zoneCode: true, city: true, state: true } } },
+    orderBy: { createdAt: 'desc' },
+  });
 };
 
 export const listAllTriggers = async () => {
-  const { rows } = await query(
-    `SELECT te.*, z.zone_name, z.zone_code, z.city, z.state
-     FROM trigger_events te
-     JOIN zones z ON z.id = te.zone_id
-     ORDER BY te.created_at DESC`
-  );
-  return rows;
+  return prisma.triggerEvent.findMany({
+    include: { zone: { select: { zoneName: true, zoneCode: true, city: true, state: true } } },
+    orderBy: { createdAt: 'desc' },
+  });
 };
 
 export const getTriggerById = async (triggerId) => {
-  const { rows } = await query('SELECT * FROM trigger_events WHERE id = $1 LIMIT 1', [triggerId]);
-  return rows[0] ?? null;
+  return prisma.triggerEvent.findUnique({ where: { id: triggerId } });
 };
-
-export const TRIGGER_TYPES_SUPPORTED = TRIGGER_TYPES;

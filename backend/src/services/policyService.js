@@ -1,72 +1,106 @@
-import { query } from '../config/db.js';
-import { getQuoteById } from './pricingService.js';
+import prisma from '../config/db.js';
+import { v4 as uuidv4 } from 'uuid';
+import { createOrder } from './razorpayService.js';
 
-const PLAN_COVERAGE_TRIGGERS = {
-  basic: ['HEAVY_RAIN', 'SEVERE_AQI'],
-  standard: ['HEAVY_RAIN', 'FLOOD', 'SEVERE_AQI'],
-  premium: ['HEAVY_RAIN', 'FLOOD', 'SEVERE_AQI', 'HEATWAVE', 'ZONE_SHUTDOWN'],
-};
+const COVERAGE_TRIGGERS_DEFAULT = ['HEAVY_RAIN', 'FLOOD', 'SEVERE_AQI', 'HEATWAVE', 'ZONE_SHUTDOWN'];
 
+/**
+ * Generate a policy number like "SP-A1B2C3D4"
+ */
+const genPolicyNumber = () => `SP-${uuidv4().slice(0, 8).toUpperCase()}`;
+
+/**
+ * Create a new policy from a quote + create Razorpay order.
+ * Policy starts with paymentStatus='pending' until payment is verified.
+ */
 export const createPolicy = async ({ quoteId, userId }) => {
-  // 1. Fetch and validate quote
-  const quote = await getQuoteById(quoteId);
-  if (!quote) {
-    const err = new Error(`Quote not found: ${quoteId}`);
-    err.statusCode = 404;
-    throw err;
+  const quote = await prisma.pricingQuote.findUnique({
+    where: { id: quoteId },
+    include: { zone: true },
+  });
+
+  if (!quote) throw Object.assign(new Error('Quote not found.'), { statusCode: 404 });
+
+  const expiresAt = new Date(quote.expiresAt);
+  if (expiresAt < new Date()) {
+    throw Object.assign(new Error('Quote has expired. Please request a new quote.'), { statusCode: 410 });
   }
 
-  // 2. Check quote hasn't expired
-  if (new Date(quote.expires_at) < new Date()) {
-    const err = new Error('Quote has expired. Please generate a new quote.');
-    err.statusCode = 410;
-    throw err;
-  }
+  const policyNumber = genPolicyNumber();
+  const amountInPaise = Math.round(Number(quote.finalPremium) * 100);
 
-  // 3. Validate userId matches quote (if quote has a user)
-  if (quote.user_id && quote.user_id !== userId) {
-    const err = new Error('Quote does not belong to this user.');
-    err.statusCode = 403;
-    throw err;
-  }
+  // Create Razorpay order
+  const razorpayOrder = await createOrder(amountInPaise, policyNumber, {
+    policyNumber,
+    userId,
+    quoteId,
+  });
 
-  // 4. Create policy (7-day validity)
-  const { rows } = await query(
-    `INSERT INTO policies
-       (user_id, quote_id, plan_tier, final_premium, coverage_amount, coverage_triggers)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING *`,
-    [
+  // Create policy in DB (pending payment)
+  const policy = await prisma.policy.create({
+    data: {
       userId,
       quoteId,
-      quote.plan_tier,
-      quote.final_premium,
-      quote.coverage_amount,
-      PLAN_COVERAGE_TRIGGERS[quote.plan_tier] ?? PLAN_COVERAGE_TRIGGERS.basic,
-    ]
-  );
+      policyNumber,
+      planTier: quote.planTier,
+      status: 'active', // will be valid once payment confirmed
+      finalPremium: quote.finalPremium,
+      coverageAmount: quote.coverageAmount,
+      coverageTriggers: COVERAGE_TRIGGERS_DEFAULT,
+      razorpayOrderId: razorpayOrder.id,
+      paymentStatus: 'pending',
+    },
+  });
 
-  return rows[0];
+  return { policy, razorpayOrder };
 };
 
+/**
+ * Activate policy after successful payment
+ */
+export const activatePolicy = async ({ policyId, razorpayPaymentId }) => {
+  return prisma.policy.update({
+    where: { id: policyId },
+    data: {
+      paymentStatus: 'paid',
+      razorpayPaymentId,
+      status: 'active',
+    },
+  });
+};
+
+/**
+ * Get all active policies for a user (with zone info via quote join)
+ */
 export const getActivePoliciesByUser = async (userId) => {
-  const { rows } = await query(
-    `SELECT
-       p.*,
-       pq.work_type, pq.city, pq.pincode,
-       pq.base_premium, pq.loc_risk_surcharge,
-       pq.worker_exp_factor, pq.plan_surcharge,
-       pq.discount_applied, pq.risk_band,
-       z.zone_name, z.zone_code, z.risk_level,
-       p.coverage_triggers
-     FROM policies p
-     JOIN pricing_quotes pq ON pq.id = p.quote_id
-     JOIN zones z ON z.id = pq.zone_id
-     WHERE p.user_id = $1
-       AND p.status = 'active'
-       AND p.valid_until > NOW()
-     ORDER BY p.created_at DESC`,
-    [userId]
-  );
-  return rows;
+  return prisma.policy.findMany({
+    where: { userId },
+    include: {
+      quote: { include: { zone: true } },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+};
+
+/**
+ * Get a single policy with all relations
+ */
+export const getPolicyById = async (policyId) => {
+  return prisma.policy.findUnique({
+    where: { id: policyId },
+    include: {
+      quote: { include: { zone: true } },
+      claims: { include: { triggerEvent: true } },
+    },
+  });
+};
+
+/**
+ * Expire overdue policies (called by scheduler)
+ */
+export const expireOverduePolicies = async () => {
+  return prisma.policy.updateMany({
+    where: { status: 'active', validUntil: { lt: new Date() } },
+    data: { status: 'expired' },
+  });
 };

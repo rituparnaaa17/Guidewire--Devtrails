@@ -1,12 +1,14 @@
 import { Router } from 'express';
-import { createPolicyHandler, getUserPolicies } from '../controllers/policyController.js';
+import { createPolicyHandler, verifyPaymentHandler, demoActivateHandler, getUserPolicies, getPolicyHandler } from '../controllers/policyController.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
-// POST /api/policies/create
-router.post('/create', createPolicyHandler);
-
-// GET /api/policies/:userId
-router.get('/:userId', getUserPolicies);
+router.post('/create',          requireAuth, createPolicyHandler);
+router.post('/verify-payment',  requireAuth, verifyPaymentHandler);
+router.post('/demo-activate',   requireAuth, demoActivateHandler);  // demo bypass
+router.get('/user',             requireAuth, getUserPolicies);
+router.get('/:policyId',        requireAuth, getPolicyHandler);
 
 export default router;
+

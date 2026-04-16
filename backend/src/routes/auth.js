@@ -1,11 +1,11 @@
 import { Router } from 'express';
-import { register, login, getSettings, updateSettings } from '../controllers/authController.js';
+import { sendOtp, verifyOtp, getMe } from '../controllers/authController.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
-router.post('/register', register);
-router.post('/login', login);
-router.get('/settings/:userId', getSettings);
-router.put('/settings/:userId', updateSettings);
+router.post('/send-otp',   sendOtp);
+router.post('/verify-otp', verifyOtp);
+router.get('/me',          requireAuth, getMe);
 
 export default router;

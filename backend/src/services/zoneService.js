@@ -1,45 +1,53 @@
-import { query } from '../config/db.js';
+import prisma from '../config/db.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZONE RESOLUTION
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Resolve zone by pincode → city fallback → default zone
- * Returns zone row from DB
+ * Resolve zone by pincode → city → fallback to DEFAULT zone
  */
-export const resolveZone = async ({ city, pincode }) => {
-  // 1️⃣ Pincode lookup (most precise)
+export const resolveZone = async ({ city, pincode } = {}) => {
+  // 1. Try pincode lookup
   if (pincode) {
-    const { rows } = await query(
-      `SELECT z.*
-       FROM pincode_zone_map pzm
-       JOIN zones z ON z.id = pzm.zone_id
-       WHERE pzm.pincode = $1
-       LIMIT 1`,
-      [pincode.toString().trim()]
-    );
-    if (rows.length > 0) return { zone: rows[0], resolvedBy: 'pincode' };
+    const pincodeMap = await prisma.pincodeZoneMap.findUnique({
+      where: { pincode: String(pincode) },
+      include: { zone: true },
+    });
+    if (pincodeMap) return { zone: pincodeMap.zone, resolvedBy: 'pincode' };
   }
 
-  // 2️⃣ City fallback (pick highest-risk zone for the city — safer estimate)
+  // 2. Try city name match
   if (city) {
-    const { rows } = await query(
-      `SELECT * FROM zones
-       WHERE LOWER(city) = LOWER($1)
-       ORDER BY risk_factor DESC
-       LIMIT 1`,
-      [city.trim()]
-    );
-    if (rows.length > 0) return { zone: rows[0], resolvedBy: 'city' };
+    const zone = await prisma.zone.findFirst({
+      where: { city: { contains: city, mode: 'insensitive' } },
+      orderBy: { riskFactor: 'desc' },
+    });
+    if (zone) return { zone, resolvedBy: 'city' };
   }
 
-  // 3️⃣ Default zone (always exists after seed)
-  const { rows } = await query(
-    `SELECT * FROM zones WHERE zone_code = 'DEFAULT' LIMIT 1`
-  );
+  // 3. Fallback to DEFAULT zone
+  const fallback = await prisma.zone.findFirst({
+    where: { zoneCode: 'DEFAULT' },
+  });
+  if (fallback) return { zone: fallback, resolvedBy: 'default' };
 
-  if (rows.length === 0) {
-    const err = new Error('No default zone configured in DB');
-    err.statusCode = 500;
-    throw err;
-  }
+  throw Object.assign(new Error('No zone found and no DEFAULT zone configured.'), { statusCode: 500 });
+};
 
-  return { zone: rows[0], resolvedBy: 'default' };
+/**
+ * Get all zones (for frontend dropdowns)
+ */
+export const getAllZones = async () => {
+  return prisma.zone.findMany({ orderBy: { zoneName: 'asc' } });
+};
+
+/**
+ * Get zones grouped by city
+ */
+export const getZonesByCity = async (city) => {
+  return prisma.zone.findMany({
+    where: { city: { contains: city, mode: 'insensitive' } },
+    orderBy: { zoneName: 'asc' },
+  });
 };
