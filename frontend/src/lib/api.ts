@@ -1,8 +1,8 @@
-const RAW_API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
-
-const API_BASE_URL = (RAW_API_BASE_URL && RAW_API_BASE_URL.length > 0
-  ? RAW_API_BASE_URL
-  : "http://localhost:5000").replace(/\/$/, "");
+// Extract a valid URL from the env var — guards against accidental extra text
+// e.g. "this is our url : https://shieldpay-1.onrender.com" → "https://shieldpay-1.onrender.com"
+const _rawEnv = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+const _urlMatch = _rawEnv.match(/https?:\/\/[^\s,;]+/);
+const API_BASE_URL = (_urlMatch ? _urlMatch[0] : "http://localhost:5000").replace(/\/$/, "");
 
 export const apiUrl = (path: string) => {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
