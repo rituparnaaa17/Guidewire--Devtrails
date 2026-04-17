@@ -42,38 +42,66 @@ export default function PlansPage() {
   const [fetchError, setFetchError] = useState("");
 
   useEffect(() => {
+    const FALLBACK_PRICING: PricingOptions = {
+      base_premium: 60,
+      quoteId: "",
+      plans: [
+        { tier: "basic",    name: "Basic",    premium: 42,  coverage: 50, multiplier: 0.7 },
+        { tier: "standard", name: "Standard", premium: 60,  coverage: 70, multiplier: 1.0 },
+        { tier: "premium",  name: "Premium",  premium: 78,  coverage: 85, multiplier: 1.3 },
+      ],
+      risk: { risk_score: 0.4, explanation: "Standard risk zone" },
+      zone: { name: "Default Zone", city: "Bengaluru" },
+    };
+
     const init = async () => {
       try {
         const parsed = getUser() as Record<string, string> | null;
-        if (!parsed) { setIsLoading(false); return; }
+
+        // If not logged in, still show fallback pricing — don't bail early
+        if (!parsed) {
+          setPricing(FALLBACK_PRICING);
+          setIsLoading(false);
+          return;
+        }
 
         const userId = parsed.id || "";
         const city   = parsed.city || "Bengaluru";
         const income = Number(parsed.income) || 4500;
-        const workType = parsed.type === "Food Delivery" || parsed.type === "delivery" ? "delivery" : (parsed.type || "other");
         const experience = Number(parsed.experience) || 1;
 
+        // Normalize work_type to one of the valid backend values
+        const rawType = (parsed.type || "").toLowerCase();
+        let workType = "other";
+        if (rawType.includes("delivery") || rawType.includes("food")) workType = "delivery";
+        else if (rawType.includes("construction")) workType = "construction";
+        else if (rawType.includes("domestic") || rawType.includes("house")) workType = "domestic";
+        else if (rawType.includes("factory") || rawType.includes("manufactur")) workType = "factory";
+        else if (rawType.includes("agri") || rawType.includes("farm")) workType = "agriculture";
+        else if (rawType.includes("retail") || rawType.includes("shop")) workType = "retail";
+
+        // Update fallback city with actual user city
+        FALLBACK_PRICING.zone = { name: "Default Zone", city };
+
         // 1. Fetch active policy first
-        let currentPolicy = null;
         if (userId) {
           try {
             const res = await fetch(apiUrl("/api/policies/user"), { headers: authHeaders() as HeadersInit });
             if (res.ok) {
               const data = await res.json();
               if (data.success && data.data && data.data.length > 0) {
-                currentPolicy = {
+                setActivePolicy({
                   id: data.data[0].id,
                   planTier: data.data[0].planTier || "standard",
-                };
-                setActivePolicy(currentPolicy);
+                });
               }
             }
           } catch {
-            // ignore
+            // ignore policy fetch errors
           }
         }
 
-        // 2. Fetch options
+        // 2. Fetch dynamic pricing options from backend
         try {
           const params = new URLSearchParams({
             city,
@@ -86,17 +114,24 @@ export default function PlansPage() {
           const res = await fetch(apiUrl(`/api/pricing/options?${params.toString()}`));
           if (res.ok) {
             const data = await res.json();
-            if (data.success && data.data) {
+            if (data.success && data.data && Array.isArray(data.data.plans) && data.data.plans.length > 0) {
               setPricing(data.data as PricingOptions);
             } else {
-              setFetchError("Failed to load plans.");
+              console.warn("Pricing API bad response, using fallback", data);
+              setPricing(FALLBACK_PRICING);
             }
+          } else {
+            const errText = await res.text().catch(() => "");
+            console.warn(`Pricing API ${res.status}, using fallback:`, errText);
+            setPricing(FALLBACK_PRICING);
           }
-        } catch {
-          setFetchError("Could not reach pricing server.");
+        } catch (e) {
+          console.warn("Pricing API unreachable, using fallback:", e);
+          setPricing(FALLBACK_PRICING);
         }
       } catch (e) {
         console.error("Plans init error:", e);
+        setPricing(FALLBACK_PRICING);
       } finally {
         setIsLoading(false);
       }
