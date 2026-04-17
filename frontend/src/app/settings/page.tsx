@@ -37,7 +37,7 @@ const DROPDOWN_OPTS: Partial<Record<keyof UserState, string[]>> = {
   weatherAlerts: ["SMS Only", "Email Only", "SMS & WhatsApp", "All Channels"],
   claimAlerts:   ["SMS Only", "Email Only", "SMS & WhatsApp", "All Channels"],
   weeklySummary: ["SMS Only", "Email Only", "All Channels", "Disabled"],
-  activePlan:    ["Basic Protection", "Shield Plus", "Max Pro"],
+  activePlan:    ["Dynamic Coverage"],
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

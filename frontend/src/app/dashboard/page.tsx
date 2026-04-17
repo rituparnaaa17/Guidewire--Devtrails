@@ -68,10 +68,11 @@ const weeklyEarnings = earningsChartData.map((item, index) => ({
   protection: index === 4 || index === 5 || index === 6 ? 0 : item.earnings,
 }));
 
+// All DB plan tier values resolve to the single Dynamic Coverage label
 const TIER_TO_NAME: Record<string, string> = {
-  basic: "Basic Protection",
-  standard: "Shield Plus",
-  premium: "Max Pro",
+  basic:    "Basic Plan",
+  standard: "Standard Plan",
+  premium:  "Premium Plan",
 };
 
 const fmtDate = (iso?: string) => {
@@ -112,11 +113,14 @@ export default function DashboardPage() {
     zone: "Koramangala",
   });
   const [plan, setPlan] = useState({
-    name: "Shield Plus",
+    name: "Standard Plan",
     price: 85,
     cap: 4500,
-    triggers: "Heavy Rain, Flood",
+    coverage: 70,
+    triggers: "Heavy Rain, Flood, Severe AQI, Heatwave",
     renewalDate: "Dec 12, 2026",
+    riskScore: null as number | null,
+    explanation: "",
   });
   const [isPaused, setIsPaused]       = useState(false);
   const [showSim,  setShowSim]        = useState(false);
@@ -165,11 +169,14 @@ export default function DashboardPage() {
         const parsedPlan = JSON.parse(storedPlan);
         setPlan((current) => ({
           ...current,
-          name: parsedPlan.name || current.name,
-          price: Number(parsedPlan.price ?? current.price),
-          cap: Number(parsedPlan.cap ?? current.cap),
-          triggers: parsedPlan.triggers || current.triggers,
+          name:        parsedPlan.name || current.name,
+          price:       Number(parsedPlan.price ?? current.price),
+          cap:         Number(parsedPlan.cap ?? current.cap),
+          coverage:    Number(parsedPlan.coverage ?? current.coverage),
+          triggers:    parsedPlan.triggers || current.triggers,
           renewalDate: parsedPlan.renewalDate || current.renewalDate,
+          riskScore:   parsedPlan.riskScore ?? current.riskScore,
+          explanation: parsedPlan.explanation || current.explanation,
         }));
       }
     } catch (e) { /* ignore */ }
@@ -187,21 +194,30 @@ export default function DashboardPage() {
             ? p.coverageTriggers
             : "Heavy Rain, Flood";
 
+          const getCoveragePct = (t: string) => {
+            if (t === 'basic') return 50;
+            if (t === 'premium') return 85;
+            return 70;
+          };
+
           const livePolicy = {
-            name: TIER_TO_NAME[tier] || "Shield Plus",
-            price: Number(p.finalPremium ?? 85),
-            cap: Number(p.coverageAmount ?? 4500),
+            name:        TIER_TO_NAME[tier] || "Standard Plan",
+            price:       Number(p.finalPremium ?? 85),
+            cap:         Number(p.coverageAmount ?? 4500),
+            coverage:    getCoveragePct(tier),
             triggers,
             renewalDate: fmtDate(p.validUntil) || "Dec 12, 2026",
+            riskScore:   p.riskScore   ?? null,
+            explanation: p.explanation ?? "",
           };
           setPlan(livePolicy);
           localStorage.setItem("shieldpay_plan", JSON.stringify({
             ...livePolicy, planTier: tier,
             policyNumber: p.policyNumber || "",
-            validFrom: p.validFrom || "",
-            validUntil: p.validUntil || "",
-            city: p.city || "",
-            zone: p.zoneName || "",
+            validFrom:    p.validFrom    || "",
+            validUntil:   p.validUntil   || "",
+            city:         p.city         || "",
+            zone:         p.zoneName     || "",
           }));
         }
       })
@@ -536,14 +552,51 @@ export default function DashboardPage() {
                       <div className="mt-5 rounded-2xl bg-white/5 border border-white/8 p-4">
                         <div className="flex items-start justify-between gap-4">
                           <div>
-                            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-300/50">Weekly Premium</p>
-                            <p className="mt-1 text-2xl font-black text-white">₹{plan.price}</p>
+                            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-300/50">📦 Current Plan</p>
+                            <p className="mt-1 text-2xl font-black text-white">{plan.name}</p>
                           </div>
                           <div className="text-right">
-                            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-300/50">Payout Cap</p>
-                            <p className="mt-1 text-2xl font-black text-white">₹{plan.cap}</p>
+                            <Link href="/plans" className="text-[10px] font-bold uppercase tracking-wider text-blue-400 hover:text-blue-300 flex items-center gap-1 justify-end mt-1">
+                              Change Plan <ChevronRight className="h-3 w-3" />
+                            </Link>
                           </div>
                         </div>
+
+                        <div className="mt-5 grid grid-cols-3 gap-2">
+                          <div className="bg-white/5 rounded-xl p-3 border border-white/5">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-blue-300/50">Premium</p>
+                            <p className="mt-1 text-base font-black text-white shrink-0">₹{plan.price}</p>
+                          </div>
+                          <div className="bg-white/5 rounded-xl p-3 border border-white/5 text-center">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-blue-300/50">Coverage</p>
+                            <p className="mt-1 text-base font-black text-white shrink-0">{plan.coverage}%</p>
+                          </div>
+                          <div className="bg-white/5 rounded-xl p-3 border border-white/5 text-right">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-blue-300/50">Max Cap</p>
+                            <p className="mt-1 text-base font-black text-white shrink-0">₹{plan.cap}</p>
+                          </div>
+                        </div>
+
+                        {/* Risk score row */}
+                        {plan.riskScore != null && (
+                          <div className="mt-3 flex items-center justify-between rounded-xl bg-white/5 border border-white/8 px-4 py-2.5">
+                            <p className="text-xs font-bold uppercase tracking-[0.22em] text-blue-300/60">📊 Risk Score</p>
+                            <p className={`text-base font-black ${
+                              plan.riskScore >= 0.65 ? 'text-red-400'
+                              : plan.riskScore >= 0.50 ? 'text-orange-400'
+                              : plan.riskScore >= 0.35 ? 'text-amber-400'
+                              : 'text-emerald-400'
+                            }`}>{plan.riskScore.toFixed(2)}</p>
+                          </div>
+                        )}
+
+                        {/* Explanation */}
+                        {plan.explanation && (
+                          <p className="mt-3 text-[11px] leading-5 text-indigo-300/70 font-medium px-1">
+                            {plan.explanation}
+                          </p>
+                        )}
+
                         <div className="mt-4 rounded-2xl bg-white/5 border border-white/8 p-4">
                           <p className="text-xs font-semibold uppercase tracking-[0.22em] text-blue-300/50">Covered triggers</p>
                           <p className="mt-2 text-sm font-semibold leading-6 text-blue-100">{plan.triggers}</p>

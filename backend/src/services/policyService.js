@@ -1,6 +1,7 @@
 import prisma from '../config/db.js';
 import { v4 as uuidv4 } from 'uuid';
 import { createOrder } from './razorpayService.js';
+import { TIER_PLANS } from './pricingService.js';
 
 const COVERAGE_TRIGGERS_DEFAULT = ['HEAVY_RAIN', 'FLOOD', 'SEVERE_AQI', 'HEATWAVE', 'ZONE_SHUTDOWN'];
 
@@ -13,7 +14,7 @@ const genPolicyNumber = () => `SP-${uuidv4().slice(0, 8).toUpperCase()}`;
  * Create a new policy from a quote + create Razorpay order.
  * Policy starts with paymentStatus='pending' until payment is verified.
  */
-export const createPolicy = async ({ quoteId, userId }) => {
+export const createPolicy = async ({ quoteId, userId, planTier = 'standard' }) => {
   const quote = await prisma.pricingQuote.findUnique({
     where: { id: quoteId },
     include: { zone: true },
@@ -26,8 +27,16 @@ export const createPolicy = async ({ quoteId, userId }) => {
     throw Object.assign(new Error('Quote has expired. Please request a new quote.'), { statusCode: 410 });
   }
 
+  const tierDef = TIER_PLANS.find((t) => t.tier === planTier) || TIER_PLANS.find(t => t.tier === 'standard');
+  const basePremium = Number(quote.finalPremium);
+  const TIER_MIN = 20;
+  const TIER_MAX = 120;
+  const finalPremiumCalculated = Math.round(
+    Math.max(TIER_MIN, Math.min(TIER_MAX, basePremium * tierDef.multiplier)) * 100
+  ) / 100;
+
   const policyNumber = genPolicyNumber();
-  const amountInPaise = Math.round(Number(quote.finalPremium) * 100);
+  const amountInPaise = Math.round(finalPremiumCalculated * 100);
 
   // Create Razorpay order
   const razorpayOrder = await createOrder(amountInPaise, policyNumber, {
@@ -42,9 +51,9 @@ export const createPolicy = async ({ quoteId, userId }) => {
       userId,
       quoteId,
       policyNumber,
-      planTier: quote.planTier,
+      planTier: tierDef.tier,
       status: 'active', // will be valid once payment confirmed
-      finalPremium: quote.finalPremium,
+      finalPremium: finalPremiumCalculated,
       coverageAmount: quote.coverageAmount,
       coverageTriggers: COVERAGE_TRIGGERS_DEFAULT,
       razorpayOrderId: razorpayOrder.id,

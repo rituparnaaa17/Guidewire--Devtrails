@@ -137,7 +137,7 @@ export default function LandingPage() {
             {[
               { step: "01", title: "Sign Up", desc: "Verify your phone via OTP in 30 seconds" },
               { step: "02", title: "Get Quoted", desc: "ML engine calculates your personalized premium" },
-              { step: "03", title: "Pay Weekly", desc: "Secure Razorpay checkout, ₹45–₹180/week" },
+              { step: "03", title: "Pay Weekly", desc: "Secure Razorpay checkout, ₹30–₹180/week" },
               { step: "04", title: "Get Paid", desc: "Auto-payout when triggers fire in your zone" },
             ].map((item, i) => (
               <div key={i} className="relative text-center p-6 rounded-2xl bg-white/3 border border-white/8">

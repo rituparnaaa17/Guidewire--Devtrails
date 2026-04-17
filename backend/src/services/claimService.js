@@ -38,6 +38,12 @@ const calculatePayout = ({ predicted, actualEarned, coveragePct, levelMultiplier
   return { netLoss: round2(netLoss), payout };
 };
 
+const getCoveragePct = (tier) => {
+  if (tier === 'basic') return 50;
+  if (tier === 'premium') return 85;
+  return 70; // standard
+};
+
 // ─── Eligibility helpers ──────────────────────────────────────────────────────
 
 const toMinutes = (t) => {
@@ -116,7 +122,7 @@ export const createClaimCandidateForTrigger = async (triggerEvent) => {
 
     const disruptionHours = Math.max(0.25, (trigEnd.getTime() - trigStart.getTime()) / (1000 * 60 * 60));
     const weeklyIncome    = Number(profile?.avgWeeklyIncome ?? policy.quote.avgWeeklyIncome ?? 4500);
-    const coveragePct     = 80;
+    const coveragePct     = getCoveragePct(policy.planTier);
     const predictedIncome = calculatePredictedIncome(weeklyIncome, disruptionHours);
     const { netLoss, payout } = calculatePayout({
       predicted:       predictedIncome,
@@ -301,7 +307,7 @@ export const autoProcessClaim = async ({
   const hours        = Math.max(0.25, (disruptEnd - disruptStart) / (1000 * 60 * 60));
 
   const weeklyIncome    = Number(policy.user.workerProfile?.avgWeeklyIncome ?? policy.quote.avgWeeklyIncome ?? 4500);
-  const coveragePct     = 80;
+  const coveragePct     = getCoveragePct(policy.planTier);
   const predictedIncome = calculatePredictedIncome(weeklyIncome, hours);
   const { netLoss, payout } = calculatePayout({
     predicted: predictedIncome, actualEarned: actual_earned,
