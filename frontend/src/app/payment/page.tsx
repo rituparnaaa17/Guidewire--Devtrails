@@ -57,54 +57,56 @@ function PaymentContent() {
   }, []);
 
   // ── Auto-generate quoteId if none came from URL ────────────────────────────
-  // This happens when the user selected a plan from fallback pricing.
-  useEffect(() => {
-    if (resolvedQuoteId) return; // already have one — skip
+  // Shared helper — fetch a fresh quoteId from the backend using stored user profile.
+  // Returns the quoteId string on success, or null on failure.
+  const fetchQuoteFromBackend = useCallback(async (): Promise<string | null> => {
     const user = getUser() as Record<string, string> | null;
-    if (!user) return;
+    if (!user) return null;
 
-    const autofetch = async () => {
-      setFetchingQuote(true);
-      try {
-        const city       = user.city  || "Bengaluru";
-        const income     = Number(user.income)     || 4500;
-        const experience = Number(user.experience) || 1;
+    const city       = user.city  || "Bengaluru";
+    const income     = Number(user.income)     || 4500;
+    const experience = Number(user.experience) || 1;
 
-        const rawType = (user.type || "").toLowerCase();
-        let workType  = "other";
-        if      (rawType.includes("delivery") || rawType.includes("food"))   workType = "delivery";
-        else if (rawType.includes("construction"))                            workType = "construction";
-        else if (rawType.includes("domestic") || rawType.includes("house"))  workType = "domestic";
-        else if (rawType.includes("factory")  || rawType.includes("manufactur")) workType = "factory";
-        else if (rawType.includes("agri")     || rawType.includes("farm"))   workType = "agriculture";
-        else if (rawType.includes("retail")   || rawType.includes("shop"))   workType = "retail";
+    const rawType = (user.type || "").toLowerCase();
+    let workType  = "other";
+    if      (rawType.includes("delivery") || rawType.includes("food"))       workType = "delivery";
+    else if (rawType.includes("construction"))                                workType = "construction";
+    else if (rawType.includes("domestic") || rawType.includes("house"))      workType = "domestic";
+    else if (rawType.includes("factory")  || rawType.includes("manufactur")) workType = "factory";
+    else if (rawType.includes("agri")     || rawType.includes("farm"))       workType = "agriculture";
+    else if (rawType.includes("retail")   || rawType.includes("shop"))       workType = "retail";
 
-        const res = await fetch(apiUrl("/api/pricing/quote"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            city,
-            avg_weekly_income: income,
-            work_type:         workType,
-            years_experience:  experience,
-            user_id:           user.id || undefined,
-          }),
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.data?.quoteId) {
-            setResolvedQuoteId(data.data.quoteId);
-          }
+    try {
+      const res = await fetch(apiUrl("/api/pricing/quote"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          city,
+          avg_weekly_income: income,
+          work_type:         workType,
+          years_experience:  experience,
+          user_id:           user.id || undefined,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.data?.quoteId) {
+          return data.data.quoteId as string;
         }
-      } catch (e) {
-        console.warn("Auto quote fetch failed — demo mode still works:", e);
-      } finally {
-        setFetchingQuote(false);
       }
-    };
+    } catch (e) {
+      console.warn("Quote fetch failed:", e);
+    }
+    return null;
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    autofetch();
+  // Background auto-fetch on mount — so quote is ready before user clicks Pay.
+  useEffect(() => {
+    if (resolvedQuoteId) return;
+    setFetchingQuote(true);
+    fetchQuoteFromBackend()
+      .then((id) => { if (id) setResolvedQuoteId(id); })
+      .finally(() => setFetchingQuote(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Persist plan to localStorage ───────────────────────────────────────────
@@ -127,14 +129,15 @@ function PaymentContent() {
   };
 
   // ── Create policy on backend ───────────────────────────────────────────────
-  const createPolicyOnBackend = async () => {
-    if (!resolvedQuoteId) {
+  const createPolicyOnBackend = async (quoteIdOverride?: string) => {
+    const qid = quoteIdOverride || resolvedQuoteId;
+    if (!qid) {
       throw new Error("Quote is still being prepared. Please wait a moment and try again.");
     }
     const createRes  = await fetch(apiUrl("/api/policies/create"), {
       method:  "POST",
       headers: authHeaders() as HeadersInit,
-      body:    JSON.stringify({ quote_id: resolvedQuoteId, plan_tier: planTierParam }),
+      body:    JSON.stringify({ quote_id: qid, plan_tier: planTierParam }),
     });
     const createData = await createRes.json();
     if (!createRes.ok) throw new Error(createData.message || "Failed to create policy.");
@@ -191,19 +194,24 @@ function PaymentContent() {
   // ── Real Razorpay payment ──────────────────────────────────────────────────
   const handleRazorpay = useCallback(async () => {
     if (!razorpayReady) { setError("Razorpay is still loading. Please wait a moment."); return; }
-    if (!resolvedQuoteId) {
-      if (fetchingQuote) {
-        setError("Your quote is being prepared — please wait a second and try again.");
-      } else {
-        setError("Could not load a quote. Please use Demo Activate below, or go back to Plans.");
-      }
-      return;
-    }
     setCreating(true);
     setError(null);
 
+    // If quote isn't ready yet, retry the fetch inline before proceeding.
+    let activeQuoteId: string | null = resolvedQuoteId || null;
+    if (!activeQuoteId) {
+      activeQuoteId = await fetchQuoteFromBackend();
+      if (activeQuoteId) {
+        setResolvedQuoteId(activeQuoteId);
+      } else {
+        setError("Could not generate a quote — Razorpay unavailable. Please use Demo Activate below.");
+        setCreating(false);
+        return;
+      }
+    }
+
     try {
-      const data = await createPolicyOnBackend();
+      const data = await createPolicyOnBackend(activeQuoteId);
       const user = getUser() as Record<string, string> | null;
 
       const options = {
